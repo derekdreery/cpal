@@ -1,6 +1,11 @@
 use crate::ChannelCount;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex
+    },
+    ptr,
+};
 use traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::{
@@ -200,7 +205,13 @@ struct LocalProcessHandler {
     temp_output_buffer_size: usize,
     temp_output_buffer_index: usize,
     playing: Arc<AtomicBool>,
+
+    /// Somewhere to store pointers to the jack buffers during de-interleving.
+    output_buffer_refs: Vec<*mut f32>,
 }
+
+unsafe impl Send for LocalProcessHandler {}
+unsafe impl Sync for LocalProcessHandler {}
 
 impl LocalProcessHandler {
     fn new(
@@ -218,6 +229,8 @@ impl LocalProcessHandler {
 
         let mut temp_output_buffer = vec![0.0; out_ports.len() * buffer_size];
 
+        // we need this after out_ports has moved.
+        let out_ports_len = out_ports.len();
         // let out_port_buffers = Vec::with_capacity(out_ports.len());
         // let in_port_buffers = Vec::with_capacity(in_ports.len());
 
@@ -236,6 +249,8 @@ impl LocalProcessHandler {
             temp_output_buffer_size: buffer_size,
             temp_output_buffer_index: 0,
             playing,
+
+            output_buffer_refs: Vec::with_capacity(out_ports_len),
         }
     }
 }
@@ -262,6 +277,12 @@ impl jack::ProcessHandler for LocalProcessHandler {
         }
 
         let current_buffer_size = process_scope.n_frames() as usize;
+
+        // Grab pointers to the jack output channels
+        self.output_buffer_refs.clear(); // truncate list of old pointers
+        for port in self.out_ports.iter() {
+            unsafe { self.output_buffer_refs.push(port.buffer(process_scope.n_frames()) as *mut f32) };
+        }
 
         if let Some(input_callback_mutex) = &mut self.input_data_callback {
             // There is an input callback
@@ -295,9 +316,10 @@ impl jack::ProcessHandler for LocalProcessHandler {
             let num_out_channels = self.out_ports.len();
 
             // Run the output callback on the temporary output buffer until we have filled the output ports
-            // JACK ports each provide a mutable slice to be filled with samples whereas CPAL uses interleaved 
+            // JACK ports each provide a mutable slice to be filled with samples whereas CPAL uses interleaved
             // channels. The formats therefore have to be bridged.
             for i in 0..current_buffer_size {
+                debug_assert!(i < isize::max_value() as usize);
                 if self.temp_output_buffer_index == self.temp_output_buffer_size {
                     // Get new samples if the temporary buffer is depleted
                     let mut data = temp_output_buffer_to_data(&mut self.temp_output_buffer);
@@ -308,9 +330,13 @@ impl jack::ProcessHandler for LocalProcessHandler {
                 for ch_ix in 0..num_out_channels {
                     // TODO: This could be very slow, it would be faster to store pointers to these slices, but I don't know how
                     // to avoid lifetime issues and allocation
-                    let output_channel = &mut self.out_ports[ch_ix].as_mut_slice(process_scope);
-                    output_channel[i] = self.temp_output_buffer
-                        [ch_ix + self.temp_output_buffer_index * num_out_channels];
+                    //let output_channel = &mut self.out_ports[ch_ix].as_mut_slice(process_scope);
+                    //output_channel[i] = self.temp_output_buffer
+                    //    [ch_ix + self.temp_output_buffer_index * num_out_channels];
+                    unsafe { ptr::write(
+                        self.output_buffer_refs[ch_ix].offset(i as isize) as *mut f32,
+                        self.temp_output_buffer[ch_ix + self.temp_output_buffer_index * num_out_channels]
+                    )};
                 }
                 // Increase the index into the temporary buffer
                 self.temp_output_buffer_index += 1;
